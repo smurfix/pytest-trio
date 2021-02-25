@@ -186,4 +186,3 @@ def test_ini_run_wins_with_blank_marker(testdir):
 
     result = testdir.runpytest()
     result.assert_outcomes(passed=1)
->>>>>>> main
