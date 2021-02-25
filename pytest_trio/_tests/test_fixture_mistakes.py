@@ -34,7 +34,7 @@ def test_trio_fixture_with_non_trio_test(testdir):
 
     result = testdir.runpytest()
 
-    result.assert_outcomes(passed=1, error=2)
+    result.assert_outcomes(passed=1, errors=2)
     result.stdout.fnmatch_lines(
         ["*: Trio fixtures can only be used by Trio tests*"]
     )
@@ -65,7 +65,7 @@ def test_trio_fixture_with_wrong_scope_without_trio_mode(testdir):
 
     result = testdir.runpytest()
 
-    result.assert_outcomes(error=1)
+    result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(["*: Trio fixtures must be function-scope*"])
 
 
@@ -89,7 +89,7 @@ def test_trio_fixture_with_wrong_scope_in_trio_mode(testdir, enable_trio_mode):
 
     result = testdir.runpytest()
 
-    result.assert_outcomes(error=1)
+    result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(["*: Trio fixtures must be function-scope*"])
 
 
@@ -113,7 +113,61 @@ def test_async_fixture_with_sync_test_in_trio_mode(testdir, enable_trio_mode):
 
     result = testdir.runpytest()
 
-    result.assert_outcomes(error=1)
+    result.assert_outcomes(errors=1)
     result.stdout.fnmatch_lines(
         ["*: Trio fixtures can only be used by Trio tests*"]
+    )
+
+
+@enable_trio_mode
+def test_fixture_cancels_test_but_doesnt_raise(testdir, enable_trio_mode):
+    enable_trio_mode(testdir)
+
+    testdir.makepyfile(
+        """
+        import pytest
+        import trio
+        from async_generator import async_generator, yield_
+
+        @pytest.fixture
+        @async_generator
+        async def async_fixture():
+            with trio.CancelScope() as cscope:
+                cscope.cancel()
+                await yield_()
+
+
+        async def test_whatever(async_fixture):
+            pass
+        """
+    )
+
+    result = testdir.runpytest()
+
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*async_fixture*cancelled the test*"])
+
+
+@enable_trio_mode
+def test_too_many_clocks(testdir, enable_trio_mode):
+    enable_trio_mode(testdir)
+
+    testdir.makepyfile(
+        """
+        import pytest
+
+        @pytest.fixture
+        def extra_clock(mock_clock):
+            return mock_clock
+
+        async def test_whatever(mock_clock, extra_clock):
+            pass
+        """
+    )
+
+    result = testdir.runpytest()
+
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(
+        ["*ValueError: too many clocks spoil the broth!*"]
     )

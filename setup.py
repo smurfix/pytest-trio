@@ -16,8 +16,9 @@ setup(
     packages=find_packages(),
     entry_points={'pytest11': ['trio = pytest_trio.plugin']},
     install_requires=[
-        "trio >= 0.11",
+        "trio >= 0.15.0",
         "async_generator >= 1.9",
+        "outcome",
         # For node.get_closest_marker
         "pytest >= 3.6"
     ],
@@ -27,7 +28,7 @@ setup(
         'testing',
         'trio',
     ],
-    python_requires=">=3.5",
+    python_requires=">=3.6",
     classifiers=[
         "License :: OSI Approved :: MIT License",
         "License :: OSI Approved :: Apache Software License",

@@ -1,12 +1,15 @@
 """pytest-trio implementation."""
+from functools import wraps, partial
 import sys
 from traceback import format_exception
 from collections.abc import Coroutine, Generator
 from inspect import iscoroutinefunction, isgeneratorfunction
 import contextvars
+import outcome
 import pytest
 import trio
-from trio.testing import MockClock, trio_test
+from trio.abc import Clock, Instrument
+from trio.testing import MockClock
 from async_generator import (
     async_generator, yield_, asynccontextmanager, isasyncgen,
     isasyncgenfunction
@@ -15,12 +18,6 @@ from async_generator import (
 ################################################################
 # Basic setup
 ################################################################
-
-if sys.version_info >= (3, 6):
-    ORDERED_DICTS = True
-else:
-    # Ordered dict (and **kwargs) not available with Python<3.6
-    ORDERED_DICTS = False
 
 try:
     from hypothesis import register_random
@@ -43,6 +40,11 @@ def pytest_addoption(parser):
         "should pytest-trio handle all async functions?",
         type="bool",
         default=False,
+    )
+    parser.addini(
+        "trio_run",
+        "what runner should pytest-trio use? [trio, qtrio]",
+        default="trio",
     )
 
 
@@ -132,11 +134,16 @@ class TrioTestContext:
     def __init__(self):
         self.crashed = False
         self.test_cancel_scope = None
+        self.fixtures_with_errors = set()
+        self.fixtures_with_cancel = set()
         self.error_list = []
 
-    def crash(self, exc):
-        if exc is not None:
+    def crash(self, fixture, exc):
+        if exc is None:
+            self.fixtures_with_cancel.add(fixture)
+        else:
             self.error_list.append(exc)
+            self.fixtures_with_errors.add(fixture)
         self.crashed = True
         if self.test_cancel_scope is not None:
             self.test_cancel_scope.cancel()
@@ -192,7 +199,7 @@ class TrioFixture:
                 finally:
                     nursery_fixture.cancel_scope.cancel()
         except BaseException as exc:
-            test_ctx.crash(exc)
+            test_ctx.crash(self, exc)
         finally:
             self.setup_done.set()
             self._teardown_done.set()
@@ -202,7 +209,7 @@ class TrioFixture:
 
         # This is a gross hack. I guess Trio should provide a context=
         # argument to start_soon/start?
-        task = trio.hazmat.current_task()
+        task = trio.lowlevel.current_task()
         assert canary not in task.context
         task.context = contextvars_ctx
         # Force a yield so we pick up the new context
@@ -278,12 +285,14 @@ class TrioFixture:
             # code will get it again if it matters), and then use a shield to
             # keep waiting for the teardown to finish without having to worry
             # about cancellation.
+            yield_outcome = outcome.Value(None)
             try:
                 for event in self.user_done_events:
                     await event.wait()
             except BaseException as exc:
                 assert isinstance(exc, trio.Cancelled)
-                test_ctx.crash(None)
+                yield_outcome = outcome.Error(exc)
+                test_ctx.crash(self, None)
                 with trio.CancelScope(shield=True):
                     for event in self.user_done_events:
                         await event.wait()
@@ -291,22 +300,67 @@ class TrioFixture:
             # Do our teardown
             if isasyncgen(func_value):
                 try:
-                    await func_value.asend(None)
+                    await yield_outcome.asend(func_value)
                 except StopAsyncIteration:
                     pass
                 else:
                     raise RuntimeError("too many yields in fixture")
             elif isinstance(func_value, Generator):
                 try:
-                    func_value.send(None)
+                    yield_outcome.send(func_value)
                 except StopIteration:
                     pass
                 else:
                     raise RuntimeError("too many yields in fixture")
 
 
+def _trio_test(run):
+    """Use:
+        @trio_test
+        async def test_whatever():
+            await ...
+
+    Also: if a pytest fixture is passed in that subclasses the ``Clock`` abc, then
+    that clock is passed to ``trio.run()``.
+    """
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(**kwargs):
+            __tracebackhide__ = True
+            clocks = [c for c in kwargs.values() if isinstance(c, Clock)]
+            if not clocks:
+                clock = None
+            elif len(clocks) == 1:
+                clock = clocks[0]
+            else:
+                raise ValueError("too many clocks spoil the broth!")
+            instruments = [
+                i for i in kwargs.values() if isinstance(i, Instrument)
+            ]
+            return run(
+                partial(fn, **kwargs), clock=clock, instruments=instruments
+            )
+
+        return wrapper
+
+    return decorator
+
+
 def _trio_test_runner_factory(item, testfunc=None):
-    testfunc = testfunc or item.obj
+    if testfunc:
+        run = trio.run
+    else:
+        testfunc = item.obj
+
+        for marker in item.iter_markers("trio"):
+            maybe_run = marker.kwargs.get('run')
+            if maybe_run is not None:
+                run = maybe_run
+                break
+        else:
+            # no marker found that explicitly specifiers the runner so use config
+            run = choose_run(config=item.config)
 
     if getattr(testfunc, '_trio_test_runner_wrapped', False):
         # We have already wrapped this, perhaps because we combined Hypothesis
@@ -318,7 +372,7 @@ def _trio_test_runner_factory(item, testfunc=None):
             'test function `%r` is marked trio but is not async' % item
         )
 
-    @trio_test
+    @_trio_test(run=run)
     async def _bootstrap_fixtures_and_run_test(**kwargs):
         __tracebackhide__ = True
 
@@ -337,6 +391,18 @@ def _trio_test_runner_factory(item, testfunc=None):
             for fixture in test.register_and_collect_dependencies():
                 nursery.start_soon(
                     fixture.run, test_ctx, contextvars_ctx, name=fixture.name
+                )
+
+        silent_cancellers = (
+            test_ctx.fixtures_with_cancel - test_ctx.fixtures_with_errors
+        )
+        if silent_cancellers:
+            for fixture in silent_cancellers:
+                test_ctx.error_list.append(
+                    RuntimeError(
+                        "{} cancelled the test but didn't "
+                        "raise an error".format(fixture.name)
+                    )
                 )
 
         if test_ctx.error_list:
@@ -424,19 +490,36 @@ def pytest_fixture_setup(fixturedef, request):
 ################################################################
 
 
-def automark(items):
+def automark(items, run=trio.run):
     for item in items:
         if hasattr(item.obj, "hypothesis"):
             test_func = item.obj.hypothesis.inner_test
         else:
             test_func = item.obj
         if iscoroutinefunction(test_func):
-            item.add_marker(pytest.mark.trio)
+            item.add_marker(pytest.mark.trio(run=run))
+
+
+def choose_run(config):
+    run_string = config.getini("trio_run")
+
+    if run_string == "trio":
+        run = trio.run
+    elif run_string == "qtrio":
+        import qtrio
+        run = qtrio.run
+    else:
+        raise ValueError(
+            f"{run_string!r} not valid for 'trio_run' config." +
+            "  Must be one of: trio, qtrio"
+        )
+
+    return run
 
 
 def pytest_collection_modifyitems(config, items):
     if config.getini("trio_mode"):
-        automark(items)
+        automark(items, run=choose_run(config=config))
 
 
 ################################################################

@@ -5,6 +5,37 @@ Release history
 
 .. towncrier release notes start
 
+pytest-trio 0.7.0 (2020-10-15)
+------------------------------
+
+Features
+~~~~~~~~
+
+- Support added for :ref:`alternative Trio run functions <trio-run-config>` via the ``trio_run`` configuration variable and ``@pytest.mark.trio(run=...)``.  Presently supports Trio and QTrio. (`#105 <https://github.com/python-trio/pytest-trio/issues/105>`__)
+
+
+Deprecations and Removals
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Python 3.5 support removed. (`#96 <https://github.com/python-trio/pytest-trio/issues/96>`__)
+
+
+pytest-trio 0.6.0 (2020-05-20)
+----------------------------------
+
+Features
+~~~~~~~~
+
+- Incompatible change: if you use ``yield`` inside a Trio fixture, and
+  the ``yield`` gets cancelled (for example, due to a background task
+  crashing), then the ``yield`` will now raise :exc:`trio.Cancelled`.
+  See :ref:`cancel-yield` for details. Also, in this same case,
+  pytest-trio will now reliably mark the test as failed, even if the
+  fixture doesn't go on to raise an exception. (`#75 <https://github.com/python-trio/pytest-trio/issues/75>`__)
+
+- Updated for compatibility with Trio v0.15.0.
+
+
 pytest-trio 0.5.2 (2019-02-13)
 ------------------------------
 
