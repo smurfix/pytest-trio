@@ -1,3 +1,9 @@
+pytest-trio (0.8.0-1) stable; urgency=medium
+
+  * Update
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Fri, 06 Dec 2024 10:24:31 +0100
+
 pytest-trio (0.7.0-1) unstable; urgency=medium
 
   * Merge
